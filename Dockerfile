@@ -21,7 +21,13 @@ COPY connectors/AAAA/oss/mirastack-connector-keycloak/go.mod \
      connectors/AAAA/oss/mirastack-connector-keycloak/
 
 WORKDIR /src/connectors/AAAA/oss/mirastack-connector-keycloak
-RUN go mod download
+RUN for attempt in 1 2 3 4 5; do \
+      go mod download && exit 0; \
+      echo "go mod download failed (attempt ${attempt}/5), retrying..." >&2; \
+      sleep $((attempt * 3)); \
+    done; \
+    echo "go mod download failed after 5 attempts" >&2; \
+    exit 1
 
 WORKDIR /src
 COPY connectors/AAAA/oss/mirastack-connector-keycloak/ connectors/AAAA/oss/mirastack-connector-keycloak/
