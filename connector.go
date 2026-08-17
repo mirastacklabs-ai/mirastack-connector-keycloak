@@ -28,9 +28,17 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	connectorv1 "github.com/mirastacklabs-ai/mirastack-connector-sdk-go/gen/connectorv1"
+	"github.com/mirastacklabs-ai/mirastack-connector-sdk-go/obs"
 	"go.uber.org/zap"
 
 	mirastack "github.com/mirastacklabs-ai/mirastack-connector-sdk-go"
+)
+
+const (
+	connectorTargetKindKeycloak = "keycloak"
+	connectorAuthOutcomeOK      = "ok"
+	connectorAuthOutcomeDenied  = "denied"
+	connectorAuthOutcomeNA      = "n/a"
 )
 
 // ---------------------------------------------------------------------------
@@ -100,15 +108,21 @@ func NewKeycloakConnector(cfg KeycloakConfig, version string, logger *zap.Logger
 
 	// Connectivity probe — HEAD to the token endpoint.
 	tokenURL := c.tokenURL()
-	probeReq, err := http.NewRequestWithContext(context.Background(), http.MethodHead, tokenURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("keycloak: build probe request: %w", err)
-	}
-	resp, err := c.client.Do(probeReq)
+	_, err = obs.RecordConnectorCall(context.Background(), cfg.ProviderName, connectorTargetKindKeycloak, func(ctx context.Context) (obs.CallResult, error) {
+		probeReq, reqErr := http.NewRequestWithContext(ctx, http.MethodHead, tokenURL, nil)
+		if reqErr != nil {
+			return obs.CallResult{AuthOutcome: connectorAuthOutcomeNA}, reqErr
+		}
+		resp, probeErr := c.client.Do(probeReq)
+		if probeErr != nil {
+			return obs.CallResult{AuthOutcome: connectorAuthOutcomeNA}, probeErr
+		}
+		resp.Body.Close()
+		return obs.CallResult{AuthOutcome: connectorAuthOutcomeNA}, nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("keycloak: connectivity probe to %s failed: %w", tokenURL, err)
 	}
-	resp.Body.Close()
 
 	return c, nil
 }
@@ -166,21 +180,28 @@ func (c *KeycloakConnector) Execute(_ context.Context, _ *mirastack.ExecuteReque
 }
 
 // HealthCheck probes the Keycloak token endpoint and returns plugin health.
-func (c *KeycloakConnector) HealthCheck(_ context.Context) error {
+func (c *KeycloakConnector) HealthCheck(ctx context.Context) error {
 	c.mu.RLock()
 	tokenURL := c.tokenURL()
 	client := c.client
+	connectorName := c.cfg.ProviderName
 	c.mu.RUnlock()
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodHead, tokenURL, nil)
-	if err != nil {
-		return fmt.Errorf("build request: %w", err)
-	}
-	resp, err := client.Do(req)
+	_, err := obs.RecordConnectorCall(ctx, connectorName, connectorTargetKindKeycloak, func(callCtx context.Context) (obs.CallResult, error) {
+		req, reqErr := http.NewRequestWithContext(callCtx, http.MethodHead, tokenURL, nil)
+		if reqErr != nil {
+			return obs.CallResult{AuthOutcome: connectorAuthOutcomeNA}, reqErr
+		}
+		resp, probeErr := client.Do(req)
+		if probeErr != nil {
+			return obs.CallResult{AuthOutcome: connectorAuthOutcomeNA}, probeErr
+		}
+		resp.Body.Close()
+		return obs.CallResult{AuthOutcome: connectorAuthOutcomeNA}, nil
+	})
 	if err != nil {
 		return fmt.Errorf("probe: %w", err)
 	}
-	resp.Body.Close()
 	return nil
 }
 
@@ -273,7 +294,7 @@ type keycloakClaims struct {
 }
 
 // Authenticate implements the OIDC ROPC flow against Keycloak.
-func (c *KeycloakConnector) Authenticate(_ context.Context, req *connectorv1.AuthnRequest) (*connectorv1.AuthnResult, error) {
+func (c *KeycloakConnector) Authenticate(ctx context.Context, req *connectorv1.AuthnRequest) (*connectorv1.AuthnResult, error) {
 	c.mu.RLock()
 	cfg := c.cfg
 	client := c.client
@@ -287,121 +308,147 @@ func (c *KeycloakConnector) Authenticate(_ context.Context, req *connectorv1.Aut
 		}, nil
 	}
 
-	// Step 1 — ROPC token request.
-	tokenURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/token",
-		strings.TrimRight(cfg.KeycloakURL, "/"), cfg.Realm)
+	var authResult *connectorv1.AuthnResult
+	_, callErr := obs.RecordConnectorCall(ctx, cfg.ProviderName, connectorTargetKindKeycloak, func(callCtx context.Context) (obs.CallResult, error) {
+		// Step 1 — ROPC token request.
+		tokenURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/token",
+			strings.TrimRight(cfg.KeycloakURL, "/"), cfg.Realm)
 
-	formData := url.Values{
-		"grant_type":    {"password"},
-		"client_id":     {cfg.ClientID},
-		"client_secret": {cfg.ClientSecret},
-		"username":      {req.Email},
-		"password":      {req.Password},
-		"scope":         {"openid email profile"},
-	}
-
-	httpReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost, tokenURL,
-		strings.NewReader(formData.Encode()))
-	if err != nil {
-		c.logger.Error("failed to build token request", zap.Error(err))
-		return &connectorv1.AuthnResult{
-			Reason:  connectorv1.AuthnReasonProviderUnavailable,
-			Message: "internal error building auth request",
-		}, nil
-	}
-	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		c.logger.Warn("Keycloak token endpoint unreachable", zap.Error(err))
-		return &connectorv1.AuthnResult{
-			Reason:  connectorv1.AuthnReasonProviderUnavailable,
-			Message: fmt.Sprintf("cannot reach Keycloak: %v", err),
-		}, nil
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB safety cap
-	if err != nil {
-		return &connectorv1.AuthnResult{
-			Reason:  connectorv1.AuthnReasonProviderUnavailable,
-			Message: "failed to read Keycloak response",
-		}, nil
-	}
-
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusBadRequest {
-		var errResp keycloakErrorResponse
-		if jsonErr := json.Unmarshal(body, &errResp); jsonErr == nil {
-			switch errResp.Error {
-			case "invalid_grant":
-				return &connectorv1.AuthnResult{
-					Reason:  connectorv1.AuthnReasonInvalidCredentials,
-					Message: errResp.ErrorDescription,
-				}, nil
-			case "account_disabled":
-				return &connectorv1.AuthnResult{
-					Reason:  connectorv1.AuthnReasonUserDeactivated,
-					Message: errResp.ErrorDescription,
-				}, nil
-			}
+		formData := url.Values{
+			"grant_type":    {"password"},
+			"client_id":     {cfg.ClientID},
+			"client_secret": {cfg.ClientSecret},
+			"username":      {req.Email},
+			"password":      {req.Password},
+			"scope":         {"openid email profile"},
 		}
-		return &connectorv1.AuthnResult{
-			Reason:  connectorv1.AuthnReasonInvalidCredentials,
-			Message: "authentication rejected by Keycloak",
-		}, nil
-	}
 
-	if resp.StatusCode != http.StatusOK {
-		c.logger.Error("unexpected Keycloak response", zap.Int("status", resp.StatusCode))
+		httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, tokenURL,
+			strings.NewReader(formData.Encode()))
+		if err != nil {
+			c.logger.Error("failed to build token request", zap.Error(err))
+			authResult = &connectorv1.AuthnResult{
+				Reason:  connectorv1.AuthnReasonProviderUnavailable,
+				Message: "internal error building auth request",
+			}
+			return obs.CallResult{AuthOutcome: connectorAuthOutcomeNA}, err
+		}
+		httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			c.logger.Warn("Keycloak token endpoint unreachable", zap.Error(err))
+			authResult = &connectorv1.AuthnResult{
+				Reason:  connectorv1.AuthnReasonProviderUnavailable,
+				Message: fmt.Sprintf("cannot reach Keycloak: %v", err),
+			}
+			return obs.CallResult{AuthOutcome: connectorAuthOutcomeNA}, err
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB safety cap
+		if err != nil {
+			authResult = &connectorv1.AuthnResult{
+				Reason:  connectorv1.AuthnReasonProviderUnavailable,
+				Message: "failed to read Keycloak response",
+			}
+			return obs.CallResult{AuthOutcome: connectorAuthOutcomeNA}, err
+		}
+
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusBadRequest {
+			var errResp keycloakErrorResponse
+			if jsonErr := json.Unmarshal(body, &errResp); jsonErr == nil {
+				switch errResp.Error {
+				case "invalid_grant":
+					authResult = &connectorv1.AuthnResult{
+						Reason:  connectorv1.AuthnReasonInvalidCredentials,
+						Message: errResp.ErrorDescription,
+					}
+					return obs.CallResult{AuthOutcome: connectorAuthOutcomeDenied}, nil
+				case "account_disabled":
+					authResult = &connectorv1.AuthnResult{
+						Reason:  connectorv1.AuthnReasonUserDeactivated,
+						Message: errResp.ErrorDescription,
+					}
+					return obs.CallResult{AuthOutcome: connectorAuthOutcomeDenied}, nil
+				}
+			}
+			authResult = &connectorv1.AuthnResult{
+				Reason:  connectorv1.AuthnReasonInvalidCredentials,
+				Message: "authentication rejected by Keycloak",
+			}
+			return obs.CallResult{AuthOutcome: connectorAuthOutcomeDenied}, nil
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			c.logger.Error("unexpected Keycloak response", zap.Int("status", resp.StatusCode))
+			authResult = &connectorv1.AuthnResult{
+				Reason:  connectorv1.AuthnReasonProviderUnavailable,
+				Message: fmt.Sprintf("Keycloak returned status %d", resp.StatusCode),
+			}
+			return obs.CallResult{AuthOutcome: connectorAuthOutcomeNA}, fmt.Errorf("keycloak returned status %d", resp.StatusCode)
+		}
+
+		// Step 2 — Parse the token response.
+		var tokenResp keycloakTokenResponse
+		if err := json.Unmarshal(body, &tokenResp); err != nil {
+			authResult = &connectorv1.AuthnResult{
+				Reason:  connectorv1.AuthnReasonProviderUnavailable,
+				Message: "failed to decode Keycloak token response",
+			}
+			return obs.CallResult{AuthOutcome: connectorAuthOutcomeNA}, err
+		}
+
+		// Step 3 — Decode JWT claims (no signature verification needed here —
+		// we received the token directly from Keycloak over TLS; we trust the
+		// source, not the token itself as a bearer credential).
+		parser := jwt.NewParser(jwt.WithoutClaimsValidation())
+		var claims keycloakClaims
+		if _, _, err := parser.ParseUnverified(tokenResp.AccessToken, &claims); err != nil {
+			authResult = &connectorv1.AuthnResult{
+				Reason:  connectorv1.AuthnReasonProviderUnavailable,
+				Message: "failed to decode JWT claims",
+			}
+			return obs.CallResult{AuthOutcome: connectorAuthOutcomeNA}, err
+		}
+
+		// Step 4 — Map realm roles.
+		role := mapKeycloakRole(claims.RealmAccess, roleMap, cfg.DefaultRole)
+
+		username := claims.PreferredUsername
+		if username == "" {
+			username = deriveUsernameFromEmail(req.Email)
+		}
+		displayName := claims.Name
+		if displayName == "" {
+			displayName = username
+		}
+
+		authResult = &connectorv1.AuthnResult{
+			Reason: connectorv1.AuthnReasonOK,
+			User: &connectorv1.AuthnUser{
+				ExternalSubject: claims.Sub,
+				Email:           claims.Email,
+				Username:        username,
+				DisplayName:     displayName,
+				Role:            role,
+				ProviderName:    cfg.ProviderName,
+			},
+		}
+		return obs.CallResult{AuthOutcome: connectorAuthOutcomeOK}, nil
+	})
+	if authResult != nil {
+		return authResult, nil
+	}
+	if callErr != nil {
 		return &connectorv1.AuthnResult{
 			Reason:  connectorv1.AuthnReasonProviderUnavailable,
-			Message: fmt.Sprintf("Keycloak returned status %d", resp.StatusCode),
+			Message: fmt.Sprintf("cannot reach Keycloak: %v", callErr),
 		}, nil
 	}
-
-	// Step 2 — Parse the token response.
-	var tokenResp keycloakTokenResponse
-	if err := json.Unmarshal(body, &tokenResp); err != nil {
-		return &connectorv1.AuthnResult{
-			Reason:  connectorv1.AuthnReasonProviderUnavailable,
-			Message: "failed to decode Keycloak token response",
-		}, nil
-	}
-
-	// Step 3 — Decode JWT claims (no signature verification needed here —
-	// we received the token directly from Keycloak over TLS; we trust the
-	// source, not the token itself as a bearer credential).
-	parser := jwt.NewParser(jwt.WithoutClaimsValidation())
-	var claims keycloakClaims
-	if _, _, err := parser.ParseUnverified(tokenResp.AccessToken, &claims); err != nil {
-		return &connectorv1.AuthnResult{
-			Reason:  connectorv1.AuthnReasonProviderUnavailable,
-			Message: "failed to decode JWT claims",
-		}, nil
-	}
-
-	// Step 4 — Map realm roles.
-	role := mapKeycloakRole(claims.RealmAccess, roleMap, cfg.DefaultRole)
-
-	username := claims.PreferredUsername
-	if username == "" {
-		username = deriveUsernameFromEmail(req.Email)
-	}
-	displayName := claims.Name
-	if displayName == "" {
-		displayName = username
-	}
-
 	return &connectorv1.AuthnResult{
-		Reason: connectorv1.AuthnReasonOK,
-		User: &connectorv1.AuthnUser{
-			ExternalSubject: claims.Sub,
-			Email:           claims.Email,
-			Username:        username,
-			DisplayName:     displayName,
-			Role:            role,
-			ProviderName:    cfg.ProviderName,
-		},
+		Reason:  connectorv1.AuthnReasonProviderUnavailable,
+		Message: "authentication rejected by Keycloak",
 	}, nil
 }
 
